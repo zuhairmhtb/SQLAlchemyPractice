@@ -13,6 +13,7 @@ from typing import List, Optional
 # ── Third-party ───────────────────────────────────────────────────────────────
 import bcrypt
 from flask import Flask, g, jsonify, request
+from flask_caching import Cache
 from flask.views import MethodView
 from flask_jwt_extended import (
     JWTManager,
@@ -65,6 +66,8 @@ SECRET_KEY: str     = os.getenv("SECRET_KEY",     "dev-secret-key-change-in-prod
 JWT_SECRET_KEY: str = os.getenv("JWT_SECRET_KEY", "dev-jwt-secret-change-in-production")
 LOG_LEVEL: str      = os.getenv("LOG_LEVEL", "INFO").upper()
 APP_ENV: str        = os.getenv("APP_ENV", "development")
+REDIS_URL: str      = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+CACHE_TTL: int      = int(os.getenv("CACHE_TTL", "60"))   # seconds
 
 # -- Logging initialisation ---------------------------------------------------
 logging.basicConfig(
@@ -334,6 +337,13 @@ app.config.update(
     OPENAPI_SWAGGER_UI_URL="https://cdn.jsdelivr.net/npm/swagger-ui-dist/",
 )
 
+app.config.update(
+    CACHE_TYPE="RedisCache",
+    CACHE_REDIS_URL=REDIS_URL,
+    CACHE_DEFAULT_TIMEOUT=CACHE_TTL,
+)
+
+cache = Cache(app)      # Initialise flask-caching (Redis back-end)
 jwt = JWTManager(app)   # Initialise flask-jwt-extended
 api = Api(app)          # Initialise flask-smorest
 
@@ -685,6 +695,20 @@ def _user_to_schema(user: User) -> dict:
     }
 
 
+# ── Cache helpers ────────────────────────────────────────────────────────────
+def _bust_department_cache() -> None:
+    """Delete all Redis keys that belong to the department-list cache."""
+    try:
+        redis_client = cache.cache._write_client   # underlying redis-py client
+        pattern = f"{cache.cache.key_prefix}departments:*"
+        keys = redis_client.keys(pattern)
+        if keys:
+            redis_client.delete(*keys)
+            logger.info("Busted %d department cache key(s)", len(keys))
+    except Exception as exc:  # pragma: no cover
+        logger.warning("Cache bust failed (non-fatal): %s", exc)
+
+
 # ── Department blueprint (protected) ─────────────────────────────────────────
 dept_blp = Blueprint(
     "departments",
@@ -707,7 +731,19 @@ class DepartmentList(MethodView):
         List departments. **Requires: admin | manager | viewer**
 
         Demonstrates **query parameters**: `search`, `page`, `per_page`.
+        Results are cached in Redis for ``CACHE_TTL`` seconds; the cache key
+        encodes all query parameters so different pages/searches are stored
+        independently.
         """
+        cache_key = (
+            f"departments:search={query_args.get('search')}"
+            f":page={query_args['page']}:per_page={query_args['per_page']}"
+        )
+        cached = cache.get(cache_key)
+        if cached is not None:
+            logger.info("Cache HIT  key=%s", cache_key)
+            return cached
+
         db: Session = g.db
         q = db.query(Department)
 
@@ -718,9 +754,11 @@ class DepartmentList(MethodView):
         offset = (query_args["page"] - 1) * query_args["per_page"]
         departments = q.offset(offset).limit(query_args["per_page"]).all()
 
-        logger.info("Listed %d/%d departments (page=%d)", len(departments), total,
-                    query_args["page"])
-        return DepartmentSchema(many=True).dump(departments)
+        result = DepartmentSchema(many=True).dump(departments)
+        cache.set(cache_key, result, timeout=CACHE_TTL)
+        logger.info("Cache MISS key=%s — cached %d/%d departments (page=%d)",
+                    cache_key, len(departments), total, query_args["page"])
+        return result
 
     @dept_blp.arguments(DepartmentSchema)
     @dept_blp.response(201, DepartmentSchema)
@@ -733,6 +771,8 @@ class DepartmentList(MethodView):
         db.add(dept)
         db.commit()
         db.refresh(dept)
+        # Bust all department-list cache entries so stale data is never served
+        _bust_department_cache()
         logger.info("Created department id=%s name=%s", dept.id, dept.name)
         return DepartmentSchema().dump(dept)
 
@@ -769,6 +809,7 @@ class DepartmentItem(MethodView):
             setattr(dept, field, value)
         db.commit()
         db.refresh(dept)
+        _bust_department_cache()
         logger.info("Updated department id=%s", dept.id)
         return DepartmentSchema().dump(dept)
 
@@ -783,6 +824,7 @@ class DepartmentItem(MethodView):
             return jsonify(error="Department not found"), 404
         db.delete(dept)
         db.commit()
+        _bust_department_cache()
         logger.info("Deleted department id=%s", dept_id)
 
 
